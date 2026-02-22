@@ -2,14 +2,11 @@
   "name": "whato-webhook-legal",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "openai": "^4.52.0"
+    "node-fetch": "^3.3.2"
   }
 }
