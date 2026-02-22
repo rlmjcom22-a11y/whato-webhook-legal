@@ -3,7 +3,10 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// Railway: SIEMPRE escuchar en process.env.PORT
 const PORT = process.env.PORT || 8080;
+
+// Modelo configurable por variable de entorno
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 
 const ADDRESS_BLOCK =
@@ -60,26 +63,33 @@ function normalizeText(v) {
 
 function looksLikeAddressRequest(text) {
   const t = text.toLowerCase();
-  return t.includes("domicilio") || t.includes("dirección") || t.includes("direccion") || t.includes("ubicación") || t.includes("ubicacion") || t.includes("donde están") || t.includes("dónde están") || t.includes("mapa");
+  return (
+    t.includes("domicilio") ||
+    t.includes("dirección") ||
+    t.includes("direccion") ||
+    t.includes("ubicación") ||
+    t.includes("ubicacion") ||
+    t.includes("donde están") ||
+    t.includes("dónde están") ||
+    t.includes("mapa")
+  );
 }
 
 function looksLikeAppointmentConfirmed(text) {
   const t = text.toLowerCase();
   return (
-    t.includes("ya agend") ||
-    t.includes("agendar") && (t.includes("confirm") || t.includes("listo")) ||
     t.includes("confirmo") ||
     t.includes("confirmar") ||
     t.includes("sí quiero la cita") ||
     t.includes("si quiero la cita") ||
     t.includes("quiero cita") ||
-    t.includes("me interesa la cita")
+    t.includes("me interesa la cita") ||
+    (t.includes("agendar") && (t.includes("confirm") || t.includes("listo")))
   );
 }
 
 function looksLikeHardConfirm(text) {
   const t = text.toLowerCase();
-  // Confirmación más fuerte para mandar "Su cita ha quedado establecida..."
   return (
     t.includes("confirmada") ||
     t.includes("queda confirmada") ||
@@ -94,23 +104,18 @@ function looksLikeHardConfirm(text) {
 
 async function callOpenAI(userMessage) {
   const apiKey = process.env.OPENAI_API_KEY;
+
+  // Si falta API Key, fallback controlado
   if (!apiKey) {
-    return "Por el momento no puedo procesar su solicitud. ¿Su cita la desea por la mañana o por la tarde?";
+    return "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
   }
 
   const payload = {
     model: MODEL,
     input: [
-      {
-        role: "system",
-        content: BASE_PROMPT
-      },
-      {
-        role: "user",
-        content: `Mensaje del prospecto: ${userMessage}`
-      }
+      { role: "system", content: BASE_PROMPT },
+      { role: "user", content: `Mensaje del prospecto: ${userMessage}` }
     ],
-    // Para reducir riesgos de respuestas largas:
     max_output_tokens: 220
   };
 
@@ -123,24 +128,31 @@ async function callOpenAI(userMessage) {
     body: JSON.stringify(payload)
   });
 
+  // Si OpenAI falla, fallback
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    console.error("OpenAI error status:", r.status, errText);
+    return "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
+  }
+
   const data = await r.json();
 
-  // Extraer texto de Responses API (forma típica)
+  // Extraer texto de Responses API
   const out =
-    data?.output?.[0]?.content?.find?.(c => c.type === "output_text")?.text
-    ?? data?.output?.[0]?.content?.[0]?.text
-    ?? data?.output_text
-    ?? "";
+    data?.output?.[0]?.content?.find?.((c) => c.type === "output_text")?.text ??
+    data?.output?.[0]?.content?.[0]?.text ??
+    data?.output_text ??
+    "";
 
   let text = normalizeText(out);
 
-  // Fallback seguro
   if (!text) {
-    text = "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
+    text =
+      "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
   }
 
-  // Enforce máximo 8 líneas (corta por saltos de línea)
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  // Enforce máximo 8 líneas
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
   if (lines.length > 8) {
     text = lines.slice(0, 8).join("\n");
   }
@@ -153,7 +165,7 @@ app.get("/health", (req, res) => {
   res.status(200).json({ ok: true, service: "whato-webhook", status: "healthy" });
 });
 
-// Optional: comprobar endpoint en navegador
+// Probar en navegador
 app.get("/webhook", (req, res) => {
   res.status(200).json({ ok: true, message: "Webhook activo" });
 });
@@ -161,8 +173,9 @@ app.get("/webhook", (req, res) => {
 // Main webhook
 app.post("/webhook", async (req, res) => {
   try {
-    // Whato puede mandar diferentes llaves. Probamos varias.
     const body = req.body || {};
+
+    // Whato puede enviar distintas llaves: probamos varias
     const incoming =
       body.message_content ??
       body.message ??
@@ -173,7 +186,13 @@ app.post("/webhook", async (req, res) => {
 
     const userMessage = normalizeText(incoming);
 
-    // 1) Si piden domicilio -> responde exactamente el bloque
+    // Si llega vacío, responde algo seguro
+    if (!userMessage) {
+      const fallback = "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
+      return res.status(200).json({ ok: true, reply: fallback, message: fallback, text: fallback });
+    }
+
+    // 1) Domicilio
     if (looksLikeAddressRequest(userMessage)) {
       return res.status(200).json({
         ok: true,
@@ -183,7 +202,7 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 2) Si confirman cita muy fuerte -> texto exacto de confirmación
+    // 2) Confirmación fuerte
     if (looksLikeHardConfirm(userMessage)) {
       const confirmText = "Su cita ha quedado establecida.\nLe atenderá el abogado Raúl James.\nMuchas gracias 😊";
       return res.status(200).json({
@@ -194,7 +213,7 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 3) Si “quieren cita” -> pedir horario dentro del prompt (OpenAI) pero además agregamos disponibilidad
+    // 3) Quieren cita (disponibilidad)
     if (looksLikeAppointmentConfirmed(userMessage)) {
       const extra = "Horarios: lunes a viernes de 10:30 a.m. a 6:30 p.m.";
       const ai = await callOpenAI(userMessage);
@@ -207,11 +226,10 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 4) Caso general -> IA
+    // 4) General con IA
     const reply = await callOpenAI(userMessage);
 
-    // IMPORTANTÍSIMO:
-    // Respondemos con varias llaves para que Whato tome la que necesite.
+    // Respondemos con varias llaves para compatibilidad
     return res.status(200).json({
       ok: true,
       reply,
@@ -220,12 +238,9 @@ app.post("/webhook", async (req, res) => {
     });
   } catch (err) {
     console.error("Webhook error:", err);
-    return res.status(200).json({
-      ok: false,
-      reply: "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?",
-      message: "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?",
-      text: "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?"
-    });
+    const fallback =
+      "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
+    return res.status(200).json({ ok: false, reply: fallback, message: fallback, text: fallback });
   }
 });
 
