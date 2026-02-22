@@ -1,10 +1,9 @@
-// server.js
 import express from "express";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const PORT = Number(process.env.PORT || 8080);
+const PORT = process.env.PORT || 8080;
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 
 const ADDRESS_BLOCK =
@@ -52,7 +51,7 @@ Le atenderá el abogado Raúl James.
 Muchas gracias 😊”.
 `.trim();
 
-// ---------- Helpers ----------
+/** ===================== Helpers ===================== */
 function normalizeText(v) {
   if (typeof v === "string") return v.trim();
   if (v == null) return "";
@@ -67,8 +66,9 @@ function looksLikeAddressRequest(text) {
     t.includes("direccion") ||
     t.includes("ubicación") ||
     t.includes("ubicacion") ||
-    t.includes("donde están") ||
+    t.includes("donde estan") ||
     t.includes("dónde están") ||
+    t.includes("donde están") ||
     t.includes("mapa")
   );
 }
@@ -76,36 +76,46 @@ function looksLikeAddressRequest(text) {
 function looksLikeAppointmentConfirmed(text) {
   const t = text.toLowerCase();
   return (
-    t.includes("confirmo") ||
-    t.includes("confirmar") ||
     t.includes("sí quiero la cita") ||
     t.includes("si quiero la cita") ||
     t.includes("quiero cita") ||
     t.includes("me interesa la cita") ||
-    t.includes("agendar cita") ||
-    t.includes("agendar")
+    (t.includes("agendar") && (t.includes("confirm") || t.includes("listo"))) ||
+    t.includes("confirmo") ||
+    t.includes("confirmar")
   );
 }
 
 function looksLikeHardConfirm(text) {
   const t = text.toLowerCase();
-  // Confirmación más fuerte para mandar "Su cita ha quedado establecida..."
   return (
-    t.includes("confirmada") ||
     t.includes("queda confirmada") ||
+    t.includes("confirmada") ||
     t.includes("queda agendada") ||
     t.includes("ya quedó") ||
     t.includes("ya quedo") ||
-    t.includes("listo, gracias") ||
     t.includes("perfecto, gracias") ||
+    t.includes("listo, gracias") ||
     t.includes("de acuerdo, gracias")
   );
 }
 
+function enforceMax8Lines(text) {
+  const lines = String(text || "")
+    .split("\n")
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  if (lines.length <= 8) return lines.join("\n");
+  return lines.slice(0, 8).join("\n");
+}
+
+/** ===================== OpenAI ===================== */
 async function callOpenAI(userMessage) {
   const apiKey = process.env.OPENAI_API_KEY;
+
   if (!apiKey) {
-    return "Por el momento no puedo procesar su solicitud. ¿Su cita la desea por la mañana o por la tarde?";
+    return "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
   }
 
   const payload = {
@@ -126,12 +136,14 @@ async function callOpenAI(userMessage) {
     body: JSON.stringify(payload)
   });
 
-  let data = {};
-  try {
-    data = await r.json();
-  } catch (_) {
-    // si no llega JSON, fallback
+  // Si OpenAI falla, no truenes el webhook
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    console.error("OpenAI error:", r.status, errText);
+    return "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
   }
+
+  const data = await r.json();
 
   const out =
     data?.output?.[0]?.content?.find?.(c => c.type === "output_text")?.text ??
@@ -141,119 +153,91 @@ async function callOpenAI(userMessage) {
 
   let text = normalizeText(out);
 
-  // Fallback seguro
   if (!text) {
     text =
-      "Entiendo su situación y con gusto le orientamos. " +
-      "Sí es posible promover legalmente acciones conforme al caso. " +
-      "Le invito a una cita gratuita presencial para revisar su situación. " +
-      "¿Su cita la desea por la mañana o por la tarde?";
+      "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
   }
 
-  // Enforce máximo 8 líneas
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-  if (lines.length > 8) {
-    text = lines.slice(0, 8).join("\n");
-  }
-
-  return text;
+  return enforceMax8Lines(text);
 }
 
-// ---------- Rutas de salud (EVITAN REINICIOS EN RAILWAY) ----------
+/** ===================== Rutas (IMPORTANTES) ===================== */
+
+// ✅ Ruta raíz: esto ayuda muchísimo a Railway healthchecks
 app.get("/", (req, res) => {
-  // Railway a veces hace healthcheck a "/"
   res.status(200).send("OK");
 });
 
+// ✅ Healthcheck recomendado
 app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, service: "whato-webhook", status: "healthy" });
+  res.status(200).json({ ok: true, service: "whato-webhook-legal", status: "healthy" });
 });
 
-// Optional: comprobar endpoint en navegador
+// ✅ Para probar en navegador
 app.get("/webhook", (req, res) => {
   res.status(200).json({ ok: true, message: "Webhook activo" });
 });
 
-// ---------- Main webhook ----------
+// ✅ Webhook principal
 app.post("/webhook", async (req, res) => {
-  try {
-    const body = req.body || {};
+  const body = req.body || {};
 
-    // Whato puede mandar diferentes llaves. Probamos varias.
-    const incoming =
-      body.message_content ??
-      body.message ??
-      body.text ??
-      body.body ??
-      body?.data?.message ??
-      "";
+  // Log mínimo para ver si Whato sí pega
+  console.log("INCOMING /webhook keys:", Object.keys(body));
 
-    const userMessage = normalizeText(incoming);
+  const incoming =
+    body.message_content ??
+    body.message ??
+    body.text ??
+    body.body ??
+    body?.data?.message ??
+    body?.data?.text ??
+    "";
 
-    // 1) Si piden domicilio -> responde exactamente el bloque
-    if (looksLikeAddressRequest(userMessage)) {
-      return res.status(200).json({
-        ok: true,
-        reply: ADDRESS_BLOCK,
-        message: ADDRESS_BLOCK,
-        text: ADDRESS_BLOCK
-      });
-    }
+  const userMessage = normalizeText(incoming);
 
-    // 2) Confirmación fuerte -> texto exacto
-    if (looksLikeHardConfirm(userMessage)) {
-      const confirmText =
-        "Su cita ha quedado establecida.\n" +
-        "Le atenderá el abogado Raúl James.\n" +
-        "Muchas gracias 😊";
+  // Si llega vacío, responde algo igual (para no romper Whato)
+  if (!userMessage) {
+    const fallback = "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
+    return res.status(200).json({ ok: true, reply: fallback, message: fallback, text: fallback });
+  }
 
-      return res.status(200).json({
-        ok: true,
-        reply: confirmText,
-        message: confirmText,
-        text: confirmText
-      });
-    }
-
-    // 3) Si “quieren cita” -> agrega horarios
-    if (looksLikeAppointmentConfirmed(userMessage)) {
-      const extra = "Horarios: lunes a viernes de 10:30 a.m. a 6:30 p.m.";
-      const ai = await callOpenAI(userMessage);
-      const combined = `${ai}\n${extra}`.split("\n").slice(0, 8).join("\n");
-      return res.status(200).json({
-        ok: true,
-        reply: combined,
-        message: combined,
-        text: combined
-      });
-    }
-
-    // 4) Caso general -> IA
-    const reply = await callOpenAI(userMessage);
-
-    // Respondemos con varias llaves para que Whato tome la que necesite.
+  // 1) Domicilio
+  if (looksLikeAddressRequest(userMessage)) {
     return res.status(200).json({
       ok: true,
-      reply,
-      message: reply,
-      text: reply
-    });
-  } catch (err) {
-    console.error("Webhook error:", err);
-    const fallback =
-      "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. " +
-      "Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
-
-    return res.status(200).json({
-      ok: false,
-      reply: fallback,
-      message: fallback,
-      text: fallback
+      reply: ADDRESS_BLOCK,
+      message: ADDRESS_BLOCK,
+      text: ADDRESS_BLOCK
     });
   }
+
+  // 2) Confirmación fuerte
+  if (looksLikeHardConfirm(userMessage)) {
+    const confirmText = "Su cita ha quedado establecida.\nLe atenderá el abogado Raúl James.\nMuchas gracias 😊";
+    return res.status(200).json({ ok: true, reply: confirmText, message: confirmText, text: confirmText });
+  }
+
+  // 3) “Quiero cita”
+  if (looksLikeAppointmentConfirmed(userMessage)) {
+    const ai = await callOpenAI(userMessage);
+    const extra = "Horarios: lunes a viernes de 10:30 a.m. a 6:30 p.m.";
+    const combined = enforceMax8Lines(`${ai}\n${extra}`);
+    return res.status(200).json({ ok: true, reply: combined, message: combined, text: combined });
+  }
+
+  // 4) General
+  const reply = await callOpenAI(userMessage);
+  return res.status(200).json({ ok: true, reply, message: reply, text: reply });
 });
 
-// ---------- Listen (PUERTO CORRECTO PARA RAILWAY) ----------
+/** ===================== Arranque ===================== */
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor activo en puerto ${PORT}`);
+});
+
+// (Opcional) shutdown limpio
+process.on("SIGTERM", () => {
+  console.log("SIGTERM recibido. Cerrando...");
+  process.exit(0);
 });
