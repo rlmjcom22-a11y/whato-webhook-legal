@@ -1,15 +1,10 @@
+// server.js
 import express from "express";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Railway: SIEMPRE escuchar en process.env.PORT
 const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor activo en puerto ${PORT}`);
-});
-
-// Modelo configurable por variable de entorno
 const MODEL = process.env.MODEL || "gpt-4o-mini";
 
 const ADDRESS_BLOCK =
@@ -57,7 +52,7 @@ Le atenderá el abogado Raúl James.
 Muchas gracias 😊”.
 `.trim();
 
-// Helpers
+// ---------- Helpers ----------
 function normalizeText(v) {
   if (typeof v === "string") return v.trim();
   if (v == null) return "";
@@ -87,12 +82,14 @@ function looksLikeAppointmentConfirmed(text) {
     t.includes("si quiero la cita") ||
     t.includes("quiero cita") ||
     t.includes("me interesa la cita") ||
-    (t.includes("agendar") && (t.includes("confirm") || t.includes("listo")))
+    t.includes("agendar cita") ||
+    t.includes("agendar")
   );
 }
 
 function looksLikeHardConfirm(text) {
   const t = text.toLowerCase();
+  // Confirmación más fuerte para mandar "Su cita ha quedado establecida..."
   return (
     t.includes("confirmada") ||
     t.includes("queda confirmada") ||
@@ -107,10 +104,8 @@ function looksLikeHardConfirm(text) {
 
 async function callOpenAI(userMessage) {
   const apiKey = process.env.OPENAI_API_KEY;
-
-  // Si falta API Key, fallback controlado
   if (!apiKey) {
-    return "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
+    return "Por el momento no puedo procesar su solicitud. ¿Su cita la desea por la mañana o por la tarde?";
   }
 
   const payload = {
@@ -131,31 +126,32 @@ async function callOpenAI(userMessage) {
     body: JSON.stringify(payload)
   });
 
-  // Si OpenAI falla, fallback
-  if (!r.ok) {
-    const errText = await r.text().catch(() => "");
-    console.error("OpenAI error status:", r.status, errText);
-    return "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
+  let data = {};
+  try {
+    data = await r.json();
+  } catch (_) {
+    // si no llega JSON, fallback
   }
 
-  const data = await r.json();
-
-  // Extraer texto de Responses API
   const out =
-    data?.output?.[0]?.content?.find?.((c) => c.type === "output_text")?.text ??
+    data?.output?.[0]?.content?.find?.(c => c.type === "output_text")?.text ??
     data?.output?.[0]?.content?.[0]?.text ??
     data?.output_text ??
     "";
 
   let text = normalizeText(out);
 
+  // Fallback seguro
   if (!text) {
     text =
-      "Entiendo su situación y con gusto le orientamos. Sí es posible promover legalmente acciones conforme al caso. Le invito a una cita gratuita presencial para revisar su situación. ¿Su cita la desea por la mañana o por la tarde?";
+      "Entiendo su situación y con gusto le orientamos. " +
+      "Sí es posible promover legalmente acciones conforme al caso. " +
+      "Le invito a una cita gratuita presencial para revisar su situación. " +
+      "¿Su cita la desea por la mañana o por la tarde?";
   }
 
   // Enforce máximo 8 líneas
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
   if (lines.length > 8) {
     text = lines.slice(0, 8).join("\n");
   }
@@ -163,22 +159,27 @@ async function callOpenAI(userMessage) {
   return text;
 }
 
-// Health check
+// ---------- Rutas de salud (EVITAN REINICIOS EN RAILWAY) ----------
+app.get("/", (req, res) => {
+  // Railway a veces hace healthcheck a "/"
+  res.status(200).send("OK");
+});
+
 app.get("/health", (req, res) => {
   res.status(200).json({ ok: true, service: "whato-webhook", status: "healthy" });
 });
 
-// Probar en navegador
+// Optional: comprobar endpoint en navegador
 app.get("/webhook", (req, res) => {
   res.status(200).json({ ok: true, message: "Webhook activo" });
 });
 
-// Main webhook
+// ---------- Main webhook ----------
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body || {};
 
-    // Whato puede enviar distintas llaves: probamos varias
+    // Whato puede mandar diferentes llaves. Probamos varias.
     const incoming =
       body.message_content ??
       body.message ??
@@ -189,13 +190,7 @@ app.post("/webhook", async (req, res) => {
 
     const userMessage = normalizeText(incoming);
 
-    // Si llega vacío, responde algo seguro
-    if (!userMessage) {
-      const fallback = "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
-      return res.status(200).json({ ok: true, reply: fallback, message: fallback, text: fallback });
-    }
-
-    // 1) Domicilio
+    // 1) Si piden domicilio -> responde exactamente el bloque
     if (looksLikeAddressRequest(userMessage)) {
       return res.status(200).json({
         ok: true,
@@ -205,9 +200,13 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 2) Confirmación fuerte
+    // 2) Confirmación fuerte -> texto exacto
     if (looksLikeHardConfirm(userMessage)) {
-      const confirmText = "Su cita ha quedado establecida.\nLe atenderá el abogado Raúl James.\nMuchas gracias 😊";
+      const confirmText =
+        "Su cita ha quedado establecida.\n" +
+        "Le atenderá el abogado Raúl James.\n" +
+        "Muchas gracias 😊";
+
       return res.status(200).json({
         ok: true,
         reply: confirmText,
@@ -216,7 +215,7 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 3) Quieren cita (disponibilidad)
+    // 3) Si “quieren cita” -> agrega horarios
     if (looksLikeAppointmentConfirmed(userMessage)) {
       const extra = "Horarios: lunes a viernes de 10:30 a.m. a 6:30 p.m.";
       const ai = await callOpenAI(userMessage);
@@ -229,10 +228,10 @@ app.post("/webhook", async (req, res) => {
       });
     }
 
-    // 4) General con IA
+    // 4) Caso general -> IA
     const reply = await callOpenAI(userMessage);
 
-    // Respondemos con varias llaves para compatibilidad
+    // Respondemos con varias llaves para que Whato tome la que necesite.
     return res.status(200).json({
       ok: true,
       reply,
@@ -242,11 +241,19 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error("Webhook error:", err);
     const fallback =
-      "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
-    return res.status(200).json({ ok: false, reply: fallback, message: fallback, text: fallback });
+      "Gracias por su mensaje. Sí es posible promover legalmente alternativas conforme al caso. " +
+      "Le invito a una cita gratuita presencial. ¿Su cita la desea por la mañana o por la tarde?";
+
+    return res.status(200).json({
+      ok: false,
+      reply: fallback,
+      message: fallback,
+      text: fallback
+    });
   }
 });
 
-app.listen(PORT, () => {
+// ---------- Listen (PUERTO CORRECTO PARA RAILWAY) ----------
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Servidor activo en puerto ${PORT}`);
 });
