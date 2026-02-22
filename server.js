@@ -4,7 +4,10 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 // Railway: SIEMPRE escuchar en process.env.PORT
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Servidor activo en puerto ${PORT}`);
+});
 
 // Modelo configurable por variable de entorno
 const MODEL = process.env.MODEL || "gpt-4o-mini";
